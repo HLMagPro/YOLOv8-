@@ -1,0 +1,254 @@
+import os
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from ultralytics import YOLO
+from tqdm import tqdm
+
+def check_dataset_structure(dataset_path):
+    """
+    检查数据集结构并返回统计信息
+    """
+    stats = {'train': 0, 'val': 0}
+    
+    # 检查训练集
+    train_path = os.path.join(dataset_path, 'train')
+    if os.path.exists(train_path):
+        images = [f for f in os.listdir(train_path) 
+                 if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        stats['train'] = len(images)
+        print(f"\n训练集: {len(images)} 张图片")
+    else:
+        print(f"错误: 训练集目录不存在: {train_path}")
+    
+    # 检查验证集
+    val_path = os.path.join(dataset_path, 'val')
+    if os.path.exists(val_path):
+        images = [f for f in os.listdir(val_path) 
+                 if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        stats['val'] = len(images)
+        print(f"验证集: {len(images)} 张图片")
+    else:
+        print(f"错误: 验证集目录不存在: {val_path}")
+    
+    return stats
+
+def analyze_single_image(model, img_path):
+    """
+    分析单张图片并返回结果
+    """
+    try:
+        results = model(img_path)
+        boxes = results[0].boxes
+        
+        # 获取置信度和类别
+        if len(boxes) > 0:
+            confidences = boxes.conf.cpu().numpy()
+            classes = boxes.cls.cpu().numpy()
+        else:
+            confidences = np.array([])
+            classes = np.array([])
+        
+        # 计算遮挡率
+        occlusions = []
+        if len(boxes) > 1:
+            boxes_xyxy = boxes.xyxy.cpu().numpy()
+            n = len(boxes_xyxy)
+            for i in range(n):
+                for j in range(i+1, n):
+                    iou = calculate_iou(boxes_xyxy[i], boxes_xyxy[j])
+                    if iou > 0:
+                        occlusions.append(iou)
+        
+        return confidences, classes, occlusions
+        
+    except Exception as e:
+        print(f"处理图片出错: {str(e)}")
+        return np.array([]), np.array([]), []
+
+def process_dataset(model, dataset_path, split='train'):
+    """
+    处理数据集并返回结果
+    """
+    results = {
+        'confidences': [],
+        'occlusions': [],
+        'class_stats': {i: {'conf': [], 'occl': []} for i in range(3)}  # 3个类别
+    }
+    
+    # 处理指定split的图片
+    split_path = os.path.join(dataset_path, split)
+    if not os.path.exists(split_path):
+        print(f"错误: {split}集目录不存在: {split_path}")
+        return None
+    
+    # 获取所有图片
+    images = [f for f in os.listdir(split_path) 
+             if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    
+    print(f"\n处理{split}集图片...")
+    for img in tqdm(images):
+        img_path = os.path.join(split_path, img)
+        confidences, classes, occlusions = analyze_single_image(model, img_path)
+        
+        # 保存置信度和类别信息
+        if len(confidences) > 0:
+            results['confidences'].extend(confidences)
+            for conf, cls in zip(confidences, classes):
+                results['class_stats'][int(cls)]['conf'].append(conf)
+        
+        # 保存遮挡率信息
+        if len(occlusions) > 0:
+            results['occlusions'].extend(occlusions)
+            if len(classes) > 0:
+                for cls in np.unique(classes):
+                    results['class_stats'][int(cls)]['occl'].extend(occlusions)
+    
+    return results
+
+def calculate_iou(box1, box2):
+    """计算IoU"""
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    if x2 < x1 or y2 < y1:
+        return 0.0
+        
+    intersection = (x2 - x1) * (y2 - y1)
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    
+    return intersection / (box1_area + box2_area - intersection)
+
+def visualize_results(train_results, val_results):
+    """
+    可视化分析结果
+    """
+    if train_results is None or val_results is None:
+        print("错误: 无法生成可视化，数据集处理失败")
+        return
+        
+    plt.style.use('seaborn')  # 使用更美观的风格
+    fig = plt.figure(figsize=(20, 10))
+    
+    # 1. 置信度分布
+    plt.subplot(2, 2, 1)
+    bins = np.linspace(0, 1, 21)  # 创建20个等宽的bin
+    plt.hist([train_results['confidences'], val_results['confidences']], 
+             bins=bins, label=['Train', 'Val'], alpha=0.7)
+    plt.title('Confidence Distribution', fontsize=12, fontweight='bold')
+    plt.xlabel('Confidence')
+    plt.ylabel('Count')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # 2. 遮挡率分布
+    plt.subplot(2, 2, 2)
+    bins = np.linspace(0, 1, 21)
+    plt.hist([train_results['occlusions'], val_results['occlusions']], 
+             bins=bins, label=['Train', 'Val'], alpha=0.7)
+    plt.title('Occlusion Ratio Distribution', fontsize=12, fontweight='bold')
+    plt.xlabel('Occlusion Ratio')
+    plt.ylabel('Count')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # 3. 各类别平均置信度
+    plt.subplot(2, 2, 3)
+    classes = ['unripe', 'half-ripe', 'ripe']
+    x = np.arange(len(classes))
+    width = 0.35
+    
+    train_means = [np.mean(train_results['class_stats'][i]['conf']) 
+                  if len(train_results['class_stats'][i]['conf']) > 0 else 0 
+                  for i in range(3)]
+    val_means = [np.mean(val_results['class_stats'][i]['conf'])
+                if len(val_results['class_stats'][i]['conf']) > 0 else 0 
+                for i in range(3)]
+    
+    plt.bar(x - width/2, train_means, width, label='Train')
+    plt.bar(x + width/2, val_means, width, label='Val')
+    plt.title('Average Confidence by Class', fontsize=12, fontweight='bold')
+    plt.xticks(x, classes, rotation=45)
+    plt.ylabel('Average Confidence')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # 4. 各类别平均遮挡率
+    plt.subplot(2, 2, 4)
+    train_occl_means = [np.mean(train_results['class_stats'][i]['occl'])
+                       if len(train_results['class_stats'][i]['occl']) > 0 else 0 
+                       for i in range(3)]
+    val_occl_means = [np.mean(val_results['class_stats'][i]['occl'])
+                     if len(val_results['class_stats'][i]['occl']) > 0 else 0 
+                     for i in range(3)]
+    
+    plt.bar(x - width/2, train_occl_means, width, label='Train')
+    plt.bar(x + width/2, val_occl_means, width, label='Val')
+    plt.title('Average Occlusion Ratio by Class', fontsize=12, fontweight='bold')
+    plt.xticks(x, classes, rotation=45)
+    plt.ylabel('Average Occlusion Ratio')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+    # 打印详细统计信息
+    print("\n=== 统计信息 ===")
+    for split, results in [("训练集", train_results), ("验证集", val_results)]:
+        print(f"\n{split}:")
+        print(f"置信度: 平均值={np.mean(results['confidences']):.3f}, "
+              f"标准差={np.std(results['confidences']):.3f}")
+        print(f"遮挡率: 平均值={np.mean(results['occlusions']):.3f}, "
+              f"标准差={np.std(results['occlusions']):.3f}")
+        print("\n各类别统计:")
+        for i, cls in enumerate(['unripe', 'half-ripe', 'ripe']):
+            confs = results['class_stats'][i]['conf']
+            occls = results['class_stats'][i]['occl']
+            print(f"{cls}:")
+            print(f"  检测数量: {len(confs)}")
+            if len(confs) > 0:
+                print(f"  平均置信度: {np.mean(confs):.3f}")
+                print(f"  平均遮挡率: {np.mean(occls):.3f}" if len(occls) > 0 else "  无遮挡")
+
+def main():
+    # 设置路径
+    model_path = input("请输入模型权重文件路径 (best.pt): ").strip()
+    dataset_path = input("请输入数据集根目录路径: ").strip()
+    
+    # 检查路径是否存在
+    if not os.path.exists(model_path):
+        print(f"错误: 模型文件不存在: {model_path}")
+        return
+    if not os.path.exists(dataset_path):
+        print(f"错误: 数据集目录不存在: {dataset_path}")
+        return
+    
+    # 检查数据集结构
+    print("\n检查数据集结构...")
+    dataset_stats = check_dataset_structure(dataset_path)
+    
+    # 加载模型
+    print("\n加载模型...")
+    try:
+        model = YOLO(model_path)
+        model.conf = 0.1  # 降低置信度阈值以获取更多检测结果
+    except Exception as e:
+        print(f"错误: 模型加载失败: {str(e)}")
+        return
+    
+    # 处理数据集
+    print("\n开始处理数据集...")
+    train_results = process_dataset(model, dataset_path, 'train')
+    val_results = process_dataset(model, dataset_path, 'val')
+    
+    # 生成可视化
+    print("\n生成可视化结果...")
+    visualize_results(train_results, val_results)
+
+if __name__ == "__main__":
+    main()
